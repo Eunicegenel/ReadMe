@@ -6,6 +6,7 @@ import android.os.Bundle
 import android.provider.OpenableColumns
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
+import android.text.Html
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -37,8 +38,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.eunicegenel.readme.ui.theme.ReadMeTheme
+import org.w3c.dom.Element
+import java.io.ByteArrayInputStream
 import java.nio.charset.Charset
 import java.util.Locale
+import java.util.zip.ZipInputStream
+import javax.xml.parsers.DocumentBuilderFactory
 
 class MainActivity : ComponentActivity() {
     private var textToSpeech: TextToSpeech? = null
@@ -194,12 +199,32 @@ fun ReaderScreen(
         try {
             stopPlayback()
 
-            val importedText = readTextFromUri(context, uri)
+            val selectedFileName = getFileName(context, uri) ?: "Selected file"
+            val mimeType = context.contentResolver.getType(uri).orEmpty()
+            val fileBytes = readBytesFromUri(context, uri)
+
+            val importedText = when {
+                selectedFileName.endsWith(".epub", ignoreCase = true) ||
+                    mimeType.equals("application/epub+zip", ignoreCase = true) -> {
+                    extractTextFromEpub(fileBytes)
+                }
+
+                selectedFileName.endsWith(".txt", ignoreCase = true) ||
+                    mimeType.startsWith("text/", ignoreCase = true) ||
+                    mimeType.equals("application/octet-stream", ignoreCase = true) -> {
+                    fileBytes.toString(Charset.forName("UTF-8"))
+                }
+
+                else -> {
+                    fileBytes.toString(Charset.forName("UTF-8"))
+                }
+            }
+
             val importedParagraphs = splitIntoParagraphs(importedText)
 
             paragraphs = importedParagraphs
             currentParagraphIndex = 0
-            fileName = getFileName(context, uri) ?: "Selected .txt file"
+            fileName = selectedFileName
 
             if (importedParagraphs.isEmpty()) {
                 Toast.makeText(
@@ -253,7 +278,7 @@ fun ReaderScreen(
             Spacer(modifier = Modifier.height(8.dp))
 
             Text(
-                text = "TXT reader test",
+                text = "TXT / EPUB reader test",
                 style = MaterialTheme.typography.bodyLarge
             )
 
@@ -266,12 +291,13 @@ fun ReaderScreen(
                         arrayOf(
                             "text/plain",
                             "text/*",
+                            "application/epub+zip",
                             "application/octet-stream"
                         )
                     )
                 }
             ) {
-                Text("Pick .txt file")
+                Text("Pick .txt or .epub file")
             }
 
             Spacer(modifier = Modifier.height(16.dp))
@@ -302,7 +328,7 @@ fun ReaderScreen(
             ) {
                 Text(
                     text = currentParagraph.ifBlank {
-                        "Pick a .txt file to begin."
+                        "Pick a .txt or .epub file to begin."
                     },
                     style = MaterialTheme.typography.bodyLarge
                 )
@@ -373,17 +399,21 @@ fun ReaderScreen(
     }
 }
 
-fun readTextFromUri(context: Context, uri: Uri): String {
+fun readBytesFromUri(context: Context, uri: Uri): ByteArray {
     return context.contentResolver.openInputStream(uri)?.use { inputStream ->
-        inputStream.readBytes().toString(Charset.forName("UTF-8"))
-    }.orEmpty()
+        inputStream.readBytes()
+    } ?: ByteArray(0)
 }
 
 fun splitIntoParagraphs(text: String): List<String> {
     return text
         .replace("\r\n", "\n")
         .replace("\r", "\n")
+        .replace("\u00A0", " ")
         .split(Regex("\\n\\s*\\n+"))
+        .flatMap { paragraph ->
+            splitLongParagraph(paragraph)
+        }
         .map { paragraph ->
             paragraph
                 .replace(Regex("[ \\t]+"), " ")
@@ -391,6 +421,35 @@ fun splitIntoParagraphs(text: String): List<String> {
                 .trim()
         }
         .filter { it.isNotBlank() }
+}
+
+fun splitLongParagraph(paragraph: String, maxLength: Int = 900): List<String> {
+    val cleaned = paragraph.trim()
+
+    if (cleaned.length <= maxLength) {
+        return listOf(cleaned)
+    }
+
+    val sentences = cleaned.split(Regex("(?<=[.!?])\\s+"))
+    val chunks = mutableListOf<String>()
+    val currentChunk = StringBuilder()
+
+    for (sentence in sentences) {
+        val candidateLength = currentChunk.length + sentence.length + 1
+
+        if (candidateLength > maxLength && currentChunk.isNotBlank()) {
+            chunks.add(currentChunk.toString().trim())
+            currentChunk.clear()
+        }
+
+        currentChunk.append(sentence).append(" ")
+    }
+
+    if (currentChunk.isNotBlank()) {
+        chunks.add(currentChunk.toString().trim())
+    }
+
+    return chunks
 }
 
 fun getFileName(context: Context, uri: Uri): String? {
@@ -403,4 +462,167 @@ fun getFileName(context: Context, uri: Uri): String? {
             null
         }
     }
+}
+
+fun extractTextFromEpub(epubBytes: ByteArray): String {
+    val entries = unzipToMap(epubBytes)
+
+    val containerXml = entries["META-INF/container.xml"]
+        ?: throw IllegalArgumentException("EPUB container.xml not found.")
+
+    val opfPath = parseOpfPath(containerXml)
+    val opfBytes = entries[opfPath]
+        ?: throw IllegalArgumentException("EPUB package file not found: $opfPath")
+
+    val chapterPaths = parseChapterPathsFromOpf(opfBytes, opfPath)
+
+    if (chapterPaths.isEmpty()) {
+        throw IllegalArgumentException("No readable EPUB chapters found.")
+    }
+
+    return chapterPaths.joinToString(separator = "\n\n") { chapterPath ->
+        val chapterBytes = entries[chapterPath]
+
+        if (chapterBytes == null) {
+            ""
+        } else {
+            htmlToPlainText(chapterBytes.toString(Charset.forName("UTF-8")))
+        }
+    }.trim()
+}
+
+fun unzipToMap(zipBytes: ByteArray): Map<String, ByteArray> {
+    val result = mutableMapOf<String, ByteArray>()
+
+    ZipInputStream(ByteArrayInputStream(zipBytes)).use { zipInputStream ->
+        while (true) {
+            val entry = zipInputStream.nextEntry ?: break
+
+            if (!entry.isDirectory) {
+                result[entry.name] = zipInputStream.readBytes()
+            }
+
+            zipInputStream.closeEntry()
+        }
+    }
+
+    return result
+}
+
+fun parseOpfPath(containerXmlBytes: ByteArray): String {
+    val document = parseXml(containerXmlBytes)
+    val rootFiles = document.getElementsByTagName("rootfile")
+
+    if (rootFiles.length == 0) {
+        val rootFilesByNamespace = document.getElementsByTagNameNS("*", "rootfile")
+        if (rootFilesByNamespace.length == 0) {
+            throw IllegalArgumentException("No rootfile found in EPUB container.")
+        }
+
+        val rootFile = rootFilesByNamespace.item(0) as Element
+        return rootFile.getAttribute("full-path")
+    }
+
+    val rootFile = rootFiles.item(0) as Element
+    return rootFile.getAttribute("full-path")
+}
+
+fun parseChapterPathsFromOpf(opfBytes: ByteArray, opfPath: String): List<String> {
+    val document = parseXml(opfBytes)
+
+    val manifestItems = getElementsByLocalName(document.documentElement, "item")
+    val spineItems = getElementsByLocalName(document.documentElement, "itemref")
+
+    val manifestById = manifestItems.associate { item ->
+        item.getAttribute("id") to item
+    }
+
+    val opfBasePath = opfPath.substringBeforeLast("/", missingDelimiterValue = "")
+
+    return spineItems.mapNotNull { itemRef ->
+        val idRef = itemRef.getAttribute("idref")
+        val manifestItem = manifestById[idRef] ?: return@mapNotNull null
+        val href = manifestItem.getAttribute("href")
+
+        if (href.isBlank()) {
+            null
+        } else {
+            normalizeZipPath(
+                if (opfBasePath.isBlank()) {
+                    href
+                } else {
+                    "$opfBasePath/$href"
+                }
+            )
+        }
+    }
+}
+
+fun parseXml(xmlBytes: ByteArray): org.w3c.dom.Document {
+    val factory = DocumentBuilderFactory.newInstance()
+    factory.isNamespaceAware = true
+
+    val builder = factory.newDocumentBuilder()
+
+    return builder.parse(ByteArrayInputStream(xmlBytes))
+}
+
+fun getElementsByLocalName(root: Element, localName: String): List<Element> {
+    val results = mutableListOf<Element>()
+    val nodes = root.getElementsByTagNameNS("*", localName)
+
+    for (index in 0 until nodes.length) {
+        val node = nodes.item(index)
+        if (node is Element) {
+            results.add(node)
+        }
+    }
+
+    if (results.isNotEmpty()) {
+        return results
+    }
+
+    val fallbackNodes = root.getElementsByTagName(localName)
+
+    for (index in 0 until fallbackNodes.length) {
+        val node = fallbackNodes.item(index)
+        if (node is Element) {
+            results.add(node)
+        }
+    }
+
+    return results
+}
+
+fun normalizeZipPath(path: String): String {
+    val parts = mutableListOf<String>()
+
+    path.split("/").forEach { part ->
+        when (part) {
+            "", "." -> Unit
+            ".." -> {
+                if (parts.isNotEmpty()) {
+                    parts.removeAt(parts.lastIndex)
+                }
+            }
+
+            else -> parts.add(part)
+        }
+    }
+
+    return parts.joinToString("/")
+}
+
+fun htmlToPlainText(html: String): String {
+    val withoutScripts = html
+        .replace(Regex("<script[\\s\\S]*?</script>", RegexOption.IGNORE_CASE), " ")
+        .replace(Regex("<style[\\s\\S]*?</style>", RegexOption.IGNORE_CASE), " ")
+        .replace(Regex("</p>", RegexOption.IGNORE_CASE), "</p>\n\n")
+        .replace(Regex("<br\\s*/?>", RegexOption.IGNORE_CASE), "<br>\n")
+        .replace(Regex("</h[1-6]>", RegexOption.IGNORE_CASE), "\n\n")
+
+    return Html.fromHtml(withoutScripts, Html.FROM_HTML_MODE_LEGACY)
+        .toString()
+        .replace(Regex("\\n{3,}"), "\n\n")
+        .trim()
 }
