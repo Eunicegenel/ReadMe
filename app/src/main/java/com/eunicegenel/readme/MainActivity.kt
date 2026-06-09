@@ -4,8 +4,6 @@ import android.content.Context
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
-import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
 import android.text.Html
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -22,14 +20,18 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -37,6 +39,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import com.eunicegenel.readme.tts.KokoroNarrationEngine
 import com.eunicegenel.readme.ui.theme.ReadMeTheme
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import com.tom_roush.pdfbox.pdmodel.PDDocument
@@ -44,29 +47,52 @@ import com.tom_roush.pdfbox.text.PDFTextStripper
 import org.w3c.dom.Element
 import java.io.ByteArrayInputStream
 import java.nio.charset.Charset
-import java.util.Locale
 import java.util.zip.ZipInputStream
 import javax.xml.parsers.DocumentBuilderFactory
 
-class MainActivity : ComponentActivity() {
-    private var textToSpeech: TextToSpeech? = null
-    private var onUtteranceDone: (() -> Unit)? = null
+data class KokoroSpeakerOption(
+    val id: Int,
+    val name: String,
+    val description: String
+)
 
-    private val paragraphUtteranceId = "readme_paragraph"
+val kokoroSpeakerOptions = listOf(
+    KokoroSpeakerOption(0, "af_alloy", "Female voice"),
+    KokoroSpeakerOption(1, "af_aoede", "Female voice"),
+    KokoroSpeakerOption(2, "af_bella", "Female voice"),
+    KokoroSpeakerOption(3, "af_heart", "Female voice"),
+    KokoroSpeakerOption(4, "af_jessica", "Female voice"),
+    KokoroSpeakerOption(5, "am_adam", "Male voice"),
+    KokoroSpeakerOption(6, "am_michael", "Male voice"),
+    KokoroSpeakerOption(7, "bf_emma", "Female voice"),
+    KokoroSpeakerOption(8, "bf_isabella", "Female voice"),
+    KokoroSpeakerOption(9, "bm_george", "Male voice"),
+    KokoroSpeakerOption(10, "bm_lewis", "Male voice")
+)
+
+class MainActivity : ComponentActivity() {
+    private var kokoroEngine: KokoroNarrationEngine? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         PDFBoxResourceLoader.init(applicationContext)
+        kokoroEngine = KokoroNarrationEngine(applicationContext)
 
         setContent {
             ReadMeTheme {
                 ReaderScreen(
-                    onInitializeTts = { onReady ->
-                        initializeTts(onReady)
+                    onInitializeEngine = { onReady ->
+                        initializeKokoro(onReady)
                     },
-                    onSpeak = { text, onDone ->
-                        speakText(text, onDone)
+                    onSpeak = { text, speakerId, speed, onDone, onError ->
+                        speakWithKokoro(
+                            text = text,
+                            speakerId = speakerId,
+                            speed = speed,
+                            onDone = onDone,
+                            onError = onError
+                        )
                     },
                     onStop = {
                         stopSpeaking()
@@ -76,124 +102,112 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun initializeTts(onReady: (Boolean) -> Unit) {
-        if (textToSpeech != null) {
-            onReady(true)
-            return
-        }
-
-        textToSpeech = TextToSpeech(this) { status ->
-            if (status == TextToSpeech.SUCCESS) {
-                val result = textToSpeech?.setLanguage(Locale.US)
-
-                val isSupported = result != TextToSpeech.LANG_MISSING_DATA &&
-                    result != TextToSpeech.LANG_NOT_SUPPORTED
-
-                textToSpeech?.setSpeechRate(0.95f)
-                textToSpeech?.setPitch(1.0f)
-
-                textToSpeech?.setOnUtteranceProgressListener(
-                    object : UtteranceProgressListener() {
-                        override fun onStart(utteranceId: String?) = Unit
-
-                        override fun onDone(utteranceId: String?) {
-                            if (utteranceId == paragraphUtteranceId) {
-                                runOnUiThread {
-                                    onUtteranceDone?.invoke()
-                                }
-                            }
-                        }
-
-                        @Deprecated("Deprecated in Java")
-                        override fun onError(utteranceId: String?) {
-                            if (utteranceId == paragraphUtteranceId) {
-                                runOnUiThread {
-                                    onUtteranceDone = null
-                                }
-                            }
-                        }
-                    }
-                )
-
-                runOnUiThread {
-                    onReady(isSupported)
-                }
-            } else {
-                runOnUiThread {
-                    onReady(false)
-                }
-            }
+    private fun initializeKokoro(onReady: (Boolean, String?) -> Unit) {
+        try {
+            kokoroEngine?.initialize()
+            onReady(true, null)
+        } catch (error: Throwable) {
+            onReady(false, error.message)
         }
     }
 
-    private fun speakText(text: String, onDone: () -> Unit) {
-        if (text.isBlank()) return
-
-        onUtteranceDone = onDone
-
-        textToSpeech?.speak(
-            text,
-            TextToSpeech.QUEUE_FLUSH,
-            null,
-            paragraphUtteranceId
+    private fun speakWithKokoro(
+        text: String,
+        speakerId: Int,
+        speed: Float,
+        onDone: () -> Unit,
+        onError: (Throwable) -> Unit
+    ) {
+        kokoroEngine?.speak(
+            text = text,
+            speakerId = speakerId,
+            speed = speed,
+            onDone = onDone,
+            onError = onError
         )
     }
 
     private fun stopSpeaking() {
-        onUtteranceDone = null
-        textToSpeech?.stop()
+        kokoroEngine?.stop()
     }
 
     override fun onDestroy() {
-        stopSpeaking()
-        textToSpeech?.shutdown()
-        textToSpeech = null
+        kokoroEngine?.shutdown()
+        kokoroEngine = null
         super.onDestroy()
     }
 }
 
 @Composable
 fun ReaderScreen(
-    onInitializeTts: ((Boolean) -> Unit) -> Unit,
-    onSpeak: (String, () -> Unit) -> Unit,
+    onInitializeEngine: ((Boolean, String?) -> Unit) -> Unit,
+    onSpeak: (String, Int, Float, () -> Unit, (Throwable) -> Unit) -> Unit,
     onStop: () -> Unit
 ) {
     val context = LocalContext.current
 
-    var isTtsReady by remember { mutableStateOf(false) }
+    var isEngineReady by remember { mutableStateOf(false) }
     var isPlaying by remember { mutableStateOf(false) }
+    var isGenerating by remember { mutableStateOf(false) }
 
     var fileName by remember { mutableStateOf("No file selected") }
     var paragraphs by remember { mutableStateOf<List<String>>(emptyList()) }
     var currentParagraphIndex by remember { mutableIntStateOf(0) }
 
+    var selectedSpeakerId by remember { mutableIntStateOf(5) }
+    var speed by remember { mutableFloatStateOf(1.0f) }
+    var showSpeakerDialog by remember { mutableStateOf(false) }
+
+    val selectedSpeaker = kokoroSpeakerOptions.firstOrNull { it.id == selectedSpeakerId }
+        ?: kokoroSpeakerOptions.first()
+
     val currentParagraph = paragraphs.getOrNull(currentParagraphIndex).orEmpty()
+
+    fun stopPlayback() {
+        isPlaying = false
+        isGenerating = false
+        onStop()
+    }
 
     fun playFromIndex(index: Int) {
         val paragraph = paragraphs.getOrNull(index)
 
         if (paragraph.isNullOrBlank()) {
             isPlaying = false
+            isGenerating = false
             return
         }
 
         currentParagraphIndex = index
         isPlaying = true
+        isGenerating = true
 
-        onSpeak(paragraph) {
-            val nextIndex = index + 1
+        onSpeak(
+            paragraph,
+            selectedSpeakerId,
+            speed,
+            {
+                val nextIndex = index + 1
 
-            if (isPlaying && nextIndex in paragraphs.indices) {
-                playFromIndex(nextIndex)
-            } else {
+                isGenerating = false
+
+                if (isPlaying && nextIndex in paragraphs.indices) {
+                    playFromIndex(nextIndex)
+                } else {
+                    isPlaying = false
+                }
+            },
+            { error ->
+                isGenerating = false
                 isPlaying = false
-            }
-        }
-    }
 
-    fun stopPlayback() {
-        isPlaying = false
-        onStop()
+                Toast.makeText(
+                    context,
+                    "Kokoro failed: ${error.message}",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        )
     }
 
     val filePickerLauncher = rememberLauncherForActivityResult(
@@ -253,13 +267,13 @@ fun ReaderScreen(
     }
 
     DisposableEffect(Unit) {
-        onInitializeTts { ready ->
-            isTtsReady = ready
+        onInitializeEngine { ready, errorMessage ->
+            isEngineReady = ready
 
             if (!ready) {
                 Toast.makeText(
                     context,
-                    "Text-to-speech is not ready on this device.",
+                    "Kokoro is not ready: ${errorMessage ?: "Unknown error"}",
                     Toast.LENGTH_LONG
                 ).show()
             }
@@ -268,6 +282,60 @@ fun ReaderScreen(
         onDispose {
             stopPlayback()
         }
+    }
+
+    if (showSpeakerDialog) {
+        AlertDialog(
+            onDismissRequest = {
+                showSpeakerDialog = false
+            },
+            title = {
+                Text("Select Kokoro speaker")
+            },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .height(420.dp)
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    kokoroSpeakerOptions.forEach { speaker ->
+                        OutlinedButton(
+                            modifier = Modifier.fillMaxWidth(),
+                            onClick = {
+                                stopPlayback()
+                                selectedSpeakerId = speaker.id
+                                showSpeakerDialog = false
+                            }
+                        ) {
+                            Column(
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text(
+                                    text = "${speaker.id} • ${speaker.name}",
+                                    style = MaterialTheme.typography.bodyMedium
+                                )
+
+                                Text(
+                                    text = speaker.description,
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showSpeakerDialog = false
+                    }
+                ) {
+                    Text("Close")
+                }
+            }
+        )
     }
 
     Scaffold(
@@ -288,11 +356,11 @@ fun ReaderScreen(
             Spacer(modifier = Modifier.height(8.dp))
 
             Text(
-                text = "TXT / EPUB / PDF reader test",
+                text = "TXT / EPUB / PDF • Kokoro neural TTS",
                 style = MaterialTheme.typography.bodyLarge
             )
 
-            Spacer(modifier = Modifier.height(24.dp))
+            Spacer(modifier = Modifier.height(20.dp))
 
             Button(
                 modifier = Modifier.fillMaxWidth(),
@@ -311,7 +379,35 @@ fun ReaderScreen(
                 Text("Pick .txt, .epub, or .pdf file")
             }
 
-            Spacer(modifier = Modifier.height(16.dp))
+            Spacer(modifier = Modifier.height(12.dp))
+
+            OutlinedButton(
+                modifier = Modifier.fillMaxWidth(),
+                enabled = isEngineReady,
+                onClick = {
+                    showSpeakerDialog = true
+                }
+            ) {
+                Text("Speaker: ${selectedSpeaker.id} • ${selectedSpeaker.name}")
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            Text(
+                text = "Speed: ${"%.2f".format(speed)}",
+                style = MaterialTheme.typography.bodyMedium
+            )
+
+            Slider(
+                value = speed,
+                onValueChange = {
+                    speed = it
+                },
+                valueRange = 0.75f..1.35f,
+                enabled = !isPlaying
+            )
+
+            Spacer(modifier = Modifier.height(12.dp))
 
             Text(
                 text = fileName,
@@ -329,7 +425,16 @@ fun ReaderScreen(
                 style = MaterialTheme.typography.bodyMedium
             )
 
-            Spacer(modifier = Modifier.height(24.dp))
+            if (isGenerating) {
+                Spacer(modifier = Modifier.height(8.dp))
+
+                Text(
+                    text = "Generating narration...",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+
+            Spacer(modifier = Modifier.height(20.dp))
 
             Column(
                 modifier = Modifier
@@ -349,7 +454,7 @@ fun ReaderScreen(
 
             Button(
                 modifier = Modifier.fillMaxWidth(),
-                enabled = isTtsReady && currentParagraph.isNotBlank(),
+                enabled = isEngineReady && currentParagraph.isNotBlank(),
                 onClick = {
                     if (isPlaying) {
                         stopPlayback()
@@ -536,6 +641,7 @@ fun parseOpfPath(containerXmlBytes: ByteArray): String {
 
     if (rootFiles.length == 0) {
         val rootFilesByNamespace = document.getElementsByTagNameNS("*", "rootfile")
+
         if (rootFilesByNamespace.length == 0) {
             throw IllegalArgumentException("No rootfile found in EPUB container.")
         }
@@ -594,6 +700,7 @@ fun getElementsByLocalName(root: Element, localName: String): List<Element> {
 
     for (index in 0 until nodes.length) {
         val node = nodes.item(index)
+
         if (node is Element) {
             results.add(node)
         }
@@ -607,6 +714,7 @@ fun getElementsByLocalName(root: Element, localName: String): List<Element> {
 
     for (index in 0 until fallbackNodes.length) {
         val node = fallbackNodes.item(index)
+
         if (node is Element) {
             results.add(node)
         }
