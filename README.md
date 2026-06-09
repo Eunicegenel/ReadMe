@@ -1,0 +1,1 @@
+The goal of this project is to make a Private Offline Text to Speech Book reader that can read .pdf, .txt, and .epub files
