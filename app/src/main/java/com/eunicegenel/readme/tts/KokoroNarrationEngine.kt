@@ -4,6 +4,7 @@ import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
+import android.util.Log
 import com.k2fsa.sherpa.onnx.GenerationConfig
 import com.k2fsa.sherpa.onnx.OfflineTts
 import com.k2fsa.sherpa.onnx.OfflineTtsConfig
@@ -15,6 +16,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.FileOutputStream
 import kotlin.math.max
 import kotlin.math.min
 
@@ -23,6 +26,7 @@ class KokoroNarrationEngine(
 ) {
     private val appContext = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val initializeLock = Any()
 
     private var tts: OfflineTts? = null
     private var audioTrack: AudioTrack? = null
@@ -30,41 +34,65 @@ class KokoroNarrationEngine(
     @Volatile
     private var isStopped = false
 
-    private val modelDir = "models/kokoro-en-v0_19"
+    private val assetModelDir = "models/kokoro-en-v0_19"
+
+    fun warmUp() {
+        scope.launch {
+            try {
+                initialize()
+                Log.d(TAG, "Kokoro warm-up complete.")
+            } catch (error: Throwable) {
+                Log.e(TAG, "Kokoro warm-up failed.", error)
+            }
+        }
+    }
 
     fun initialize() {
-        if (tts != null) return
+        synchronized(initializeLock) {
+            if (tts != null) return
 
-        val config = OfflineTtsConfig(
-            model = OfflineTtsModelConfig(
-                kokoro = OfflineTtsKokoroModelConfig(
-                    model = "$modelDir/model.onnx",
-                    voices = "$modelDir/voices.bin",
-                    tokens = "$modelDir/tokens.txt",
-                    dataDir = "$modelDir/espeak-ng-data"
+            Log.d(TAG, "Preparing Kokoro filesystem data...")
+
+            val copiedEspeakDataDir = copyEspeakDataDirToFiles()
+
+            Log.d(TAG, "Initializing Kokoro engine...")
+            Log.d(TAG, "Using espeak-ng-data at: ${copiedEspeakDataDir.absolutePath}")
+
+            val config = OfflineTtsConfig(
+                model = OfflineTtsModelConfig(
+                    kokoro = OfflineTtsKokoroModelConfig(
+                        model = "$assetModelDir/model.onnx",
+                        voices = "$assetModelDir/voices.bin",
+                        tokens = "$assetModelDir/tokens.txt",
+                        dataDir = copiedEspeakDataDir.absolutePath
+                    ),
+                    numThreads = 4,
+                    debug = false,
+                    provider = "cpu"
                 ),
-                numThreads = 4,
-                debug = true,
-                provider = "cpu"
-            ),
-            maxNumSentences = 1,
-            silenceScale = 0.15f
-        )
+                maxNumSentences = 1,
+                silenceScale = 0.2f
+            )
 
-        tts = OfflineTts(
-            assetManager = appContext.assets,
-            config = config
-        )
+            tts = OfflineTts(
+                assetManager = appContext.assets,
+                config = config
+            )
+
+            Log.d(TAG, "Kokoro engine initialized.")
+        }
     }
 
     fun speak(
         text: String,
-        speakerId: Int = 3,
+        speakerId: Int = 5,
         speed: Float = 1.0f,
         onDone: () -> Unit,
         onError: (Throwable) -> Unit
     ) {
-        if (text.isBlank()) {
+        val cleanedText = cleanTextForKokoro(text)
+
+        if (cleanedText.isBlank()) {
             onDone()
             return
         }
@@ -78,18 +106,31 @@ class KokoroNarrationEngine(
                 val engine = tts
                     ?: throw IllegalStateException("Kokoro TTS engine failed to initialize.")
 
+                val safeSpeakerId = speakerId.coerceIn(0, 10)
+                val safeSpeed = speed.coerceIn(0.75f, 1.35f)
+
+                Log.d(
+                    TAG,
+                    "Generating Kokoro audio. speakerId=$safeSpeakerId speed=$safeSpeed textLength=${cleanedText.length}"
+                )
+
                 val generationConfig = GenerationConfig(
-                    sid = speakerId,
-                    speed = speed,
-                    silenceScale = 0.15f
+                    sid = safeSpeakerId,
+                    speed = safeSpeed,
+                    silenceScale = 0.2f
                 )
 
                 val audio = engine.generateWithConfig(
-                    text = text,
+                    text = cleanedText,
                     config = generationConfig
                 )
 
-                if (!isStopped) {
+                Log.d(
+                    TAG,
+                    "Generated audio. samples=${audio.samples.size} sampleRate=${audio.sampleRate}"
+                )
+
+                if (!isStopped && audio.samples.isNotEmpty()) {
                     playFloatAudio(
                         samples = audio.samples,
                         sampleRate = audio.sampleRate
@@ -102,6 +143,8 @@ class KokoroNarrationEngine(
                     }
                 }
             } catch (error: Throwable) {
+                Log.e(TAG, "Kokoro speak failed.", error)
+
                 withContext(Dispatchers.Main) {
                     onError(error)
                 }
@@ -117,13 +160,11 @@ class KokoroNarrationEngine(
             audioTrack?.flush()
             audioTrack?.stop()
         } catch (_: Throwable) {
-            // AudioTrack can throw if stopped before fully initialized.
         }
 
         try {
             audioTrack?.release()
         } catch (_: Throwable) {
-            // Already released or invalid state.
         }
 
         audioTrack = null
@@ -136,16 +177,96 @@ class KokoroNarrationEngine(
         try {
             tts?.release()
         } catch (_: Throwable) {
-            // Native engine may already be released.
         }
 
         tts = null
+    }
+
+    private fun copyEspeakDataDirToFiles(): File {
+        val sourceAssetDir = "$assetModelDir/espeak-ng-data"
+        val targetDir = File(
+            appContext.filesDir,
+            "sherpa/models/kokoro-en-v0_19/espeak-ng-data"
+        )
+
+        val markerFile = File(targetDir, ".copy_complete")
+
+        if (targetDir.exists() && markerFile.exists()) {
+            return targetDir
+        }
+
+        if (targetDir.exists()) {
+            targetDir.deleteRecursively()
+        }
+
+        targetDir.mkdirs()
+
+        copyAssetDirectory(
+            assetDir = sourceAssetDir,
+            targetDir = targetDir
+        )
+
+        markerFile.writeText("ok")
+
+        return targetDir
+    }
+
+    private fun copyAssetDirectory(
+        assetDir: String,
+        targetDir: File
+    ) {
+        val children = appContext.assets.list(assetDir)?.toList().orEmpty()
+
+        if (children.isEmpty()) {
+            copyAssetFile(
+                assetPath = assetDir,
+                targetFile = targetDir
+            )
+            return
+        }
+
+        if (!targetDir.exists()) {
+            targetDir.mkdirs()
+        }
+
+        for (child in children) {
+            val childAssetPath = "$assetDir/$child"
+            val childTargetFile = File(targetDir, child)
+            val grandChildren = appContext.assets.list(childAssetPath)?.toList().orEmpty()
+
+            if (grandChildren.isEmpty()) {
+                copyAssetFile(
+                    assetPath = childAssetPath,
+                    targetFile = childTargetFile
+                )
+            } else {
+                copyAssetDirectory(
+                    assetDir = childAssetPath,
+                    targetDir = childTargetFile
+                )
+            }
+        }
+    }
+
+    private fun copyAssetFile(
+        assetPath: String,
+        targetFile: File
+    ) {
+        targetFile.parentFile?.mkdirs()
+
+        appContext.assets.open(assetPath).use { input ->
+            FileOutputStream(targetFile).use { output ->
+                input.copyTo(output)
+            }
+        }
     }
 
     private fun playFloatAudio(
         samples: FloatArray,
         sampleRate: Int
     ) {
+        if (samples.isEmpty() || sampleRate <= 0) return
+
         val pcmBytes = floatSamplesToPcm16Bytes(samples)
 
         val minBufferSize = AudioTrack.getMinBufferSize(
@@ -154,7 +275,7 @@ class KokoroNarrationEngine(
             AudioFormat.ENCODING_PCM_16BIT
         )
 
-        val bufferSize = max(minBufferSize, 4096)
+        val bufferSize = max(minBufferSize, 8192)
 
         val track = AudioTrack.Builder()
             .setAudioAttributes(
@@ -175,18 +296,15 @@ class KokoroNarrationEngine(
             .build()
 
         audioTrack = track
-
         track.play()
 
         var offset = 0
 
         while (offset < pcmBytes.size && !isStopped) {
-            val bytesToWrite = min(4096, pcmBytes.size - offset)
+            val bytesToWrite = min(8192, pcmBytes.size - offset)
             val written = track.write(pcmBytes, offset, bytesToWrite)
 
-            if (written <= 0) {
-                break
-            }
+            if (written <= 0) break
 
             offset += written
         }
@@ -194,13 +312,11 @@ class KokoroNarrationEngine(
         try {
             track.stop()
         } catch (_: Throwable) {
-            // Ignore invalid stop states.
         }
 
         try {
             track.release()
         } catch (_: Throwable) {
-            // Ignore release issues.
         }
 
         if (audioTrack == track) {
@@ -220,5 +336,18 @@ class KokoroNarrationEngine(
         }
 
         return output
+    }
+
+    private fun cleanTextForKokoro(text: String): String {
+        return text
+            .replace("\u0000", " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+            .take(MAX_TEXT_LENGTH_PER_GENERATION)
+    }
+
+    companion object {
+        private const val TAG = "ReadMeKokoro"
+        private const val MAX_TEXT_LENGTH_PER_GENERATION = 500
     }
 }

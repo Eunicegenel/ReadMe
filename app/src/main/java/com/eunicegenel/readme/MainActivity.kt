@@ -57,11 +57,11 @@ data class KokoroSpeakerOption(
 )
 
 val kokoroSpeakerOptions = listOf(
-    KokoroSpeakerOption(0, "af_alloy", "Female voice"),
-    KokoroSpeakerOption(1, "af_aoede", "Female voice"),
-    KokoroSpeakerOption(2, "af_bella", "Female voice"),
-    KokoroSpeakerOption(3, "af_heart", "Female voice"),
-    KokoroSpeakerOption(4, "af_jessica", "Female voice"),
+    KokoroSpeakerOption(0, "af", "Female voice"),
+    KokoroSpeakerOption(1, "af_bella", "Female voice"),
+    KokoroSpeakerOption(2, "af_nicole", "Female voice"),
+    KokoroSpeakerOption(3, "af_sarah", "Female voice"),
+    KokoroSpeakerOption(4, "af_sky", "Female voice"),
     KokoroSpeakerOption(5, "am_adam", "Male voice"),
     KokoroSpeakerOption(6, "am_michael", "Male voice"),
     KokoroSpeakerOption(7, "bf_emma", "Female voice"),
@@ -103,12 +103,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun initializeKokoro(onReady: (Boolean, String?) -> Unit) {
-        try {
-            kokoroEngine?.initialize()
-            onReady(true, null)
-        } catch (error: Throwable) {
-            onReady(false, error.message)
-        }
+      onReady(true, null)
+      kokoroEngine?.warmUp()
     }
 
     private fun speakWithKokoro(
@@ -539,7 +535,7 @@ fun splitIntoParagraphs(text: String): List<String> {
         .filter { it.isNotBlank() }
 }
 
-fun splitLongParagraph(paragraph: String, maxLength: Int = 900): List<String> {
+fun splitLongParagraph(paragraph: String, maxLength: Int = 220): List<String> {
     val cleaned = paragraph.trim()
 
     if (cleaned.length <= maxLength) {
