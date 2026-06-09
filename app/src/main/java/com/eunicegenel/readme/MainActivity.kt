@@ -38,6 +38,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.eunicegenel.readme.ui.theme.ReadMeTheme
+import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
+import com.tom_roush.pdfbox.pdmodel.PDDocument
+import com.tom_roush.pdfbox.text.PDFTextStripper
 import org.w3c.dom.Element
 import java.io.ByteArrayInputStream
 import java.nio.charset.Charset
@@ -53,6 +56,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        PDFBoxResourceLoader.init(applicationContext)
 
         setContent {
             ReadMeTheme {
@@ -209,6 +214,11 @@ fun ReaderScreen(
                     extractTextFromEpub(fileBytes)
                 }
 
+                selectedFileName.endsWith(".pdf", ignoreCase = true) ||
+                    mimeType.equals("application/pdf", ignoreCase = true) -> {
+                    extractTextFromPdf(context, fileBytes)
+                }
+
                 selectedFileName.endsWith(".txt", ignoreCase = true) ||
                     mimeType.startsWith("text/", ignoreCase = true) ||
                     mimeType.equals("application/octet-stream", ignoreCase = true) -> {
@@ -278,7 +288,7 @@ fun ReaderScreen(
             Spacer(modifier = Modifier.height(8.dp))
 
             Text(
-                text = "TXT / EPUB reader test",
+                text = "TXT / EPUB / PDF reader test",
                 style = MaterialTheme.typography.bodyLarge
             )
 
@@ -292,12 +302,13 @@ fun ReaderScreen(
                             "text/plain",
                             "text/*",
                             "application/epub+zip",
+                            "application/pdf",
                             "application/octet-stream"
                         )
                     )
                 }
             ) {
-                Text("Pick .txt or .epub file")
+                Text("Pick .txt, .epub, or .pdf file")
             }
 
             Spacer(modifier = Modifier.height(16.dp))
@@ -328,7 +339,7 @@ fun ReaderScreen(
             ) {
                 Text(
                     text = currentParagraph.ifBlank {
-                        "Pick a .txt or .epub file to begin."
+                        "Pick a .txt, .epub, or .pdf file to begin."
                     },
                     style = MaterialTheme.typography.bodyLarge
                 )
@@ -461,6 +472,16 @@ fun getFileName(context: Context, uri: Uri): String? {
         } else {
             null
         }
+    }
+}
+
+fun extractTextFromPdf(context: Context, pdfBytes: ByteArray): String {
+    PDFBoxResourceLoader.init(context.applicationContext)
+
+    return PDDocument.load(ByteArrayInputStream(pdfBytes)).use { document ->
+        val stripper = PDFTextStripper()
+        stripper.setSortByPosition(true)
+        stripper.getText(document).trim()
     }
 }
 
